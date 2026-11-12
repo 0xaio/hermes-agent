@@ -3,16 +3,20 @@ cursor instead of reseeding from history and marking downtime arrivals as seen."
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _SEEN_CAP = 500  # per-channel de-dupe set bound (events)
+_JOINED_THREADS_STATE_CAP = 256  # thread roots the agent posted into (send-side follow)
 _CURSOR_STATE_SUBDIR = "buzz"  # per-channel cursors survive a restart under HERMES_HOME
 _CURSOR_STATE_FILENAME = "channel-cursors.json"
 
 
 class BuzzCursorMixin:
+    _joined_threads: OrderedDict[str, None]  # owned by BuzzAdapter.__init__
+
     @staticmethod
     def _cursor_path() -> Path:
         from hermes_constants import get_hermes_home
@@ -42,6 +46,12 @@ class BuzzCursorMixin:
             raw_seen = entry.get("seen")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
+        raw_threads = data.get("joined_threads")
+        if isinstance(raw_threads, list):
+            self._joined_threads.clear()
+            for thread_root in raw_threads[-_JOINED_THREADS_STATE_CAP:]:
+                if root := str(thread_root or ""):
+                    self._joined_threads[root] = None
 
     def _cursor_payload(self) -> dict:
         """Snapshot of every watched channel's cursor (taken on the loop: ``_channel_state`` is loop-owned)."""
@@ -52,7 +62,8 @@ class BuzzCursorMixin:
             }
             for channel_id, state in self._channel_state.items()
         }
-        return {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
+        return {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels,
+                "joined_threads": list(self._joined_threads)[-_JOINED_THREADS_STATE_CAP:]}
 
     def _save_cursors(self) -> None:
         """Persist every watched channel's cursor.  Never raises."""

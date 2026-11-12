@@ -104,6 +104,8 @@ _CLI_TIMEOUT = 30.0
 # Mention-resolution caches: member lists are hit on every publish containing "@"; names must not outlive a rename.
 _MEMBER_CACHE_TTL = 60.0
 _PROFILE_NAME_TTL = 300.0
+# Thread roots the agent has posted into, remembered for un-mentioned follow (LRU bound).
+_JOINED_THREADS_CAP = 256
 # Inbound attachments download only after the gates pass and must match their declared NIP-94 size + SHA-256.
 _MAX_INBOUND_ATTACHMENTS = 4
 _MAX_INBOUND_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -537,6 +539,11 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         # Channel messages must @mention the agent unless disabled; DMs always dispatch.
         _rm_cfg = _setting_or("BUZZ_REQUIRE_MENTION", extra, "require_mention", True)
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+        # Inside a thread the agent already posted into, follow-ups count as addressed without a
+        # fresh @mention (Slack's thread_require_mention=False default). Bot authors are exempt
+        # from auto-follow, so two agents sharing a thread cannot answer each other forever.
+        _trm_cfg = _setting_or("BUZZ_THREAD_REQUIRE_MENTION", extra, "thread_require_mention", False)
+        self.thread_require_mention = str(_trm_cfg).strip().lower() not in ("false", "0", "no", "off")
         self._reply_to_mode: str = _reply_to_mode(config, extra)
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
@@ -573,9 +580,12 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         self._channel_meta: dict[str, dict] = {}
         self._user_names: dict[str, str] = {}
         self._member_cache: dict[str, tuple[float, list[str]]] = {}  # (monotonic, pubkeys)
+        self._member_role_cache: dict[str, tuple[float, dict[str, str]]] = {}  # (monotonic, pubkey -> role)
         self._profile_name_cache: dict[str, tuple[float, str]] = {}
         # inbound event_id -> thread root (None when top-level), so send() joins the user's thread instead of nesting.
         self._thread_roots: OrderedDict[str, Optional[str]] = OrderedDict()
+        # thread roots the agent has posted into (send-side, LRU) — drives un-mentioned thread follow.
+        self._joined_threads: OrderedDict[str, None] = OrderedDict()
 
     @property
     def name(self) -> str:
@@ -738,6 +748,33 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             cache[str(chat_id)] = (time.monotonic(), list(candidates))
         return candidates
 
+    async def _channel_member_roles(self, chat_id: str) -> Optional[dict[str, str]]:
+        """Pubkey -> channel role from ``channels members``; ``None`` when the read failed."""
+        if (cached := _ttl_get(self._member_role_cache, str(chat_id), _MEMBER_CACHE_TTL)) is not None:
+            return dict(cached)
+        code, out, err = await self._run_cli(["channels", "members", "--channel", str(chat_id)])
+        if code != 0:
+            return None
+        try:
+            rows = json.loads(out or "[]")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(rows, list):
+            return None
+        roles: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if pk := _normalize_user_ref(str(row.get("pubkey") or "")):
+                roles[pk] = str(row.get("role") or "").strip().lower()
+        self._member_role_cache[str(chat_id)] = (time.monotonic(), dict(roles))
+        return roles
+
+    async def _author_is_bot(self, chat_id: str, pubkey: str) -> bool:
+        """True when *pubkey* holds the channel ``bot`` role; unknown membership counts as bot (fail closed)."""
+        roles = await self._channel_member_roles(chat_id)
+        return roles is None or roles.get(pubkey) == "bot"
+
     async def _profile_display_name(self, pubkey: str) -> str:
         """Display name via ``users get --pubkey`` (bare ``users get`` may return only our own profile), TTL-cached."""
         cache = self._profile_name_cache
@@ -837,7 +874,21 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
     def _reply_args(self, anchor: Optional[str]) -> list[str]:
         """``--reply-to`` CLI args for *anchor*, honoring ``reply_to_mode``."""
         reply_target = self._resolve_reply_anchor(anchor)
-        return ["--reply-to", str(reply_target)] if reply_target and self._reply_to_mode != "off" else []
+        if not reply_target or self._reply_to_mode == "off":
+            return []
+        # Posting into a thread is joining it: un-mentioned follow-ups there are heard from now on.
+        self._note_joined_thread(str(reply_target))
+        return ["--reply-to", str(reply_target)]
+
+    def _note_joined_thread(self, thread_root: str) -> None:
+        """Remember a thread root the agent posted into (bounded LRU; persisted with the cursors)."""
+        if not thread_root:
+            return
+        joined = self._joined_threads
+        joined[thread_root] = None
+        joined.move_to_end(thread_root)
+        while len(joined) > _JOINED_THREADS_CAP:
+            joined.popitem(last=False)
 
     def _send_result(self, chat_id: str, code: int, out: str, err: str, *, redact_path: Optional[Path] = None) -> SendResult:
         """``messages send`` result -> SendResult; marks the verified id seen (echo suppression belt-and-braces)."""
@@ -1458,8 +1509,14 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             return
         # Cache before any early return so self-echo and concurrent-author traffic can still be reply parents.
         self._remember_event(state, event)
+        # NIP-10 root scopes the session; record it before the self-echo return too, so a restart
+        # re-learns the threads this identity joined from the seeded channel history.
+        thread_id = self._extract_thread_root(event)
+        self._record_thread_root(event_id, event)
         # See #75826.
         if pubkey == self._self_pubkey:
+            if thread_id:
+                self._note_joined_thread(str(thread_id))
             return
         # Reclassify a leaked DM before gating so its first un-mentioned message both latches and dispatches.
         self._maybe_latch_dm(channel_id, state, event)
@@ -1467,9 +1524,15 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         reply_parent_id = _event_reply_parent_id(event)
         reply_meta = self._lookup_event_meta(state, reply_parent_id) if reply_parent_id else None
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
-        # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
-        # unless require_mention is off. DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
+        # A thread the agent already posted into behaves like an ongoing conversation: plain
+        # follow-ups count as addressed. Bot authors still need an explicit address (loop guard).
+        follows_thread = bool(
+            thread_id and not self.thread_require_mention and thread_id in self._joined_threads
+            and not await self._author_is_bot(channel_id, pubkey)
+        )
+        # Channels dispatch only when addressed (@mention or p-tag), replying to us (Signal/WhatsApp parity),
+        # or continuing a thread we already joined, unless require_mention is off. DMs always dispatch.
+        if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own and not follows_thread:
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
@@ -1479,9 +1542,6 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             return
         # Strip a leading @mention (DMs often open with one too) so "@Chip /whoami" is recognized as a command.
         dispatch_text = self._strip_mention(content)
-        # NIP-10 root scopes the session; remember it so our reply joins the SAME thread instead of nesting.
-        thread_id = self._extract_thread_root(event)
-        self._record_thread_root(event_id, event)
         # Attachment fetch spends credentials: only the gateway's explicit ``True`` permits it (else fail closed).
         # The message still dispatches so GatewayRunner can apply denial/pairing.
         chat_type = "dm" if is_dm else "group"
@@ -1741,9 +1801,16 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         elif localized_urls and localized_type not in (message_type, MessageType.TEXT):
             # Mixed sources use document semantics so audio isn't routed to STT.
             message_type = MessageType.DOCUMENT
+        # A top-level channel message we answer births a thread rooted HERE (send() --reply-to).
+        # Key the turn on that thread root so every in-thread follow-up continues THIS session
+        # instead of forking a new one — the mismatch that made approvals unanswerable.
+        session_thread_id = thread_id
+        if (session_thread_id is None and chat_type == "group" and self._reply_to_mode != "off"
+                and not self._may_reclassify_as_dm(chat_id)):
+            session_thread_id = message_id
         source = self.build_source(
             chat_id=chat_id, chat_name=self._channel_names.get(chat_id, chat_id), chat_type=chat_type,
-            user_id=user_id, user_name=user_name, thread_id=thread_id, message_id=message_id,
+            user_id=user_id, user_name=user_name, thread_id=session_thread_id, message_id=message_id,
         )
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message, message_id=message_id,

@@ -62,3 +62,7 @@ optional_env:
     description: "Thread replies under the triggering message (true/false, default: true); false posts flat to the channel timeline"
     prompt: "Reply in thread? (true/false)"
     password: false
+  - name: BUZZ_THREAD_REQUIRE_MENTION
+    description: "Require an @mention for follow-ups inside a thread the agent already joined (true/false, default: false); bot authors always need one"
+    prompt: "Require mention in followed threads? (true/false)"
+    password: false
