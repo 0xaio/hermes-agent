@@ -303,6 +303,12 @@ def pending_gateway_approval_count() -> int:
         return sum(len(queue) for queue in _gateway_queues.values())
 
 
+def pending_gateway_approval_sessions() -> list[str]:
+    """Session keys holding unresolved gateway approvals (for same-chat sibling lookups)."""
+    with _lock:
+        return [key for key, queue in _gateway_queues.items() if queue]
+
+
 def get_pending_gateway_approval(session_key: str) -> dict | None:
     """Copy of the oldest unresolved gateway approval, for reconnecting clients
     to restore a prompt. Read-only snapshot — the queue stays authoritative."""

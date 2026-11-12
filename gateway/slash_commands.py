@@ -1201,6 +1201,25 @@ class GatewaySlashCommandsMixin(
             lines += [t("gateway.bundles.item", slug=info["slug"], desc=desc, count=len(skills))] + [f"    · {s}" for s in skills]
         return "\n".join(lines + ["", t("gateway.bundles.invoke_hint")])
 
+    @staticmethod
+    def _sibling_approval_session_keys(session_key: str) -> list[str]:
+        """Same-chat sibling sessions holding pending approvals (Buzz threads own separate keys)."""
+        from gateway.run import _parse_session_key
+        from tools.approval import pending_gateway_approval_sessions
+        target = _parse_session_key(session_key)
+        if not target or target.get("platform") != "buzz":
+            return []
+        siblings = []
+        for candidate in pending_gateway_approval_sessions():
+            if candidate == session_key:
+                continue
+            parsed = _parse_session_key(candidate)
+            if (parsed and parsed.get("platform") == target.get("platform")
+                    and parsed.get("chat_id") == target.get("chat_id")
+                    and parsed.get("profile") == target.get("profile")):
+                siblings.append(candidate)
+        return siblings
+
     def _blocking_approval_or_stale(self, event: MessageEvent, stale_key: str, none_key: str,
                                     resolve_all: bool = False, choice: str = "once"):
         """``(session_key, None, request_ids)`` when an agent thread is blocked on approval and the
@@ -1218,6 +1237,23 @@ class GatewaySlashCommandsMixin(
                 session_key, event.sender_id(), resolve_all=resolve_all, choice=choice,
                 admin_ids=policy_for_runner_source(self, event.source), admitted=answer_admitted(event))
             return (session_key, refusal_text(requester), []) if requester else (session_key, None, ids)
+        # Buzz keys every thread root as its own session, so a /approve typed at channel level
+        # would never reach an approval waiting inside a thread. Fall back to a sibling session of
+        # the same chat, and only for the sender who requested it (never another user's approval).
+        from gateway.approval_actor import answerable_request_ids
+        from gateway.slash_access import policy_for_runner_source
+        from tools.approval import list_gateway_approval_authority
+        sender = str(event.sender_id() or "")
+        admin_policy = policy_for_runner_source(self, event.source)
+        for sibling in self._sibling_approval_session_keys(session_key):
+            if not any(str(a.get("requester_id") or "") == sender
+                       for a in list_gateway_approval_authority(sibling)):
+                continue
+            ids, requester = answerable_request_ids(
+                sibling, event.sender_id(), resolve_all=resolve_all, choice=choice,
+                admin_ids=admin_policy)
+            if ids:
+                return sibling, None, ids
         _approval_state = self._peek_session_state(session_key)
         if _approval_state is not None and _approval_state.persistent.approvals is not None:
             _approval_state.persistent.approvals = None
