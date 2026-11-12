@@ -143,6 +143,10 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 _WS_AUTH_TIMEOUT = 20.0
+# Presence lease: the relay stores kind:20001 with a 180 s TTL (three 60 s heartbeat windows), so a
+# single missed heartbeat cannot flap presence and a crash expires within three minutes.
+_PRESENCE_HEARTBEAT_SECS = 60
+_TYPING_THROTTLE_SECS = 15
 # Last-resort read bound: an unsurfaced relay-side close (CLOSE_WAIT) would leave us "connected" with inbound stopped.
 # The library keepalive (ping_interval/ping_timeout below) should catch a dead relay first, but a relay-side
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
@@ -239,6 +243,7 @@ def _load_sibling_file(name: str):
 
 
 _nostr_auth = _load_sibling("nostr_auth")
+_presence = _load_sibling("presence")
 
 # bech32 (BIP-173) npub <-> hex so mention detection and allow-lists accept either form.
 from gateway.authz_mixin import (
@@ -560,6 +565,10 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
+        # Live WebSocket for outbound ephemeral events (presence/typing); None in poll mode.
+        self._ws_ref = None
+        self._typing_last: dict[str, float] = {}  # chat_id -> monotonic time of last typing publish
+        self._runtime_record_ts = 0  # last published kind:10100 created_at (writer discipline)
         self._membership_since = self._poll_count = 0
         # Channels the relay permanently rejected ("restricted"); persists across reconnects so we never re-subscribe.
         # channel_id -> { "chat_type", "last_ts", "seen": OrderedDict[event_id, None], "event_meta":
@@ -709,12 +718,19 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             self.relay_url, self._display_name or self._self_npub[:16], len(self._channel_state),
             transport_used, "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
         )
+        if transport_used == "websocket":
+            # Discovery surfaces (New Message / member-add / search) read the latest kind:10100 runtime record.
+            with contextlib.suppress(Exception):
+                await self._publish_runtime_record(status="online")
+        else:
+            logger.debug("Buzz: poll transport — live presence (kind:20001) needs a WebSocket; skipping")
         self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        await self._publish_offline()  # best-effort on a live socket; TTL expiry covers crashes
         with contextlib.suppress(Exception):
             self._release_platform_lock()
         await cancel_task(self._ws_task)
@@ -905,7 +921,20 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         return SendResult(success=True, message_id=event_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
+        """Kind:20002 typing indicator over the live WebSocket; poll mode has none (ephemeral kinds)."""
+        websocket = self._ws_ref
+        if websocket is None or not self._private_key or not chat_id:
+            return
+        now = time.monotonic()
+        last = self._typing_last.get(chat_id)
+        if last is not None and now - last < _TYPING_THROTTLE_SECS:
+            return
+        self._typing_last[chat_id] = now
+        try:
+            event = _presence.typing_event(self._private_key, chat_id)
+            await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+        except Exception:
+            logger.debug("Buzz: typing indicator failed for %s", str(chat_id)[:12])
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Best-effort reaction via buzz-cli; failures are logged, never raised."""
@@ -1168,6 +1197,8 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
                 ) as websocket:
                     await self._authenticate_websocket(websocket)
                     subscriptions = await self._subscribe_websocket(websocket)
+                    # Assign before the ready event so connect() never publishes on an unset ref.
+                    self._ws_ref = websocket
                     if self._ws_ready is not None:
                         self._ws_ready.set()
                     if reconnecting:
@@ -1180,6 +1211,7 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
                     tasks = {
                         asyncio.create_task(self._ws_read_loop(websocket, subscriptions)),
                         asyncio.create_task(self._ws_discovery_loop(websocket, subscriptions)),
+                        asyncio.create_task(self._presence_heartbeat(websocket)),
                     }
                     try:
                         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1189,6 +1221,8 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
                         for task in tasks:
                             task.cancel()
                         await asyncio.gather(*tasks, return_exceptions=True)
+                        if self._ws_ref is websocket:
+                            self._ws_ref = None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1262,6 +1296,66 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
             self._channel_state.pop(closed_channel, None)
         elif message[0] == "NOTICE":
             logger.warning("Buzz: relay notice: %s", message[-1])
+
+    # ── Presence / runtime record ─────────────────────────────────────────
+
+    async def _publish_presence(self, websocket, status: str) -> None:
+        """Send one signed kind:20001 over the live socket (ephemeral — WebSocket only)."""
+        event = _presence.presence_event(self._private_key, status)
+        await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+
+    async def _presence_heartbeat(self, websocket) -> None:
+        """Publish ``online`` now and every 60 s while the socket lives (relay TTL is 3× that)."""
+        from websockets.exceptions import ConnectionClosed
+
+        try:
+            await self._publish_presence(websocket, "online")
+            logger.debug("Buzz: presence online published")
+            while True:
+                await asyncio.sleep(_PRESENCE_HEARTBEAT_SECS)
+                await self._publish_presence(websocket, "online")
+        except (asyncio.CancelledError, ConnectionClosed):
+            raise  # dead socket: let the outer loop tear down and reconnect
+        except Exception:
+            logger.warning("Buzz: presence heartbeat stopped", exc_info=True)
+
+    async def _publish_runtime_record(self, status: str = "online") -> None:
+        """Kind:10100 replaceable runtime record — discovery surfaces read its explicit ``status``."""
+        websocket = self._ws_ref
+        if websocket is None or not self._private_key:
+            return
+        owner_pubkey = ""
+        tag = (getattr(self, "_auth_tag", "") or "").strip()
+        if tag:
+            try:
+                owner_pubkey = _nostr_auth.parse_auth_tag(tag, "BUZZ_AUTH_TAG")[1]
+            except ValueError:
+                pass
+        # Writer discipline: stamp strictly ahead of our own last record so a same-second republish
+        # (e.g. connect→immediate disconnect) cannot lose the NIP-16 created_at tie-break to an id.
+        ts = max(int(time.time()), self._runtime_record_ts + 1) if self._runtime_record_ts else int(time.time())
+        event = _presence.runtime_record_event(
+            self._private_key, name=self._display_name or "", owner_pubkey=owner_pubkey, status=status,
+            created_at=ts)
+        self._runtime_record_ts = ts
+        await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+
+    async def _publish_offline(self) -> None:
+        """Best-effort ``offline`` on a live socket before teardown; TTL expiry covers crashes."""
+        websocket = self._ws_ref
+        if websocket is None or not self._private_key:
+            return
+
+        async def _send_both() -> None:
+            await self._publish_presence(websocket, "offline")
+            with contextlib.suppress(Exception):
+                await self._publish_runtime_record(status="offline")
+
+        try:
+            await asyncio.wait_for(_send_both(), timeout=3)
+            logger.debug("Buzz: presence offline published")
+        except Exception:
+            logger.debug("Buzz: offline publish skipped (socket gone?)", exc_info=True)
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
