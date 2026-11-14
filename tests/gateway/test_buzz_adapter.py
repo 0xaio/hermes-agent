@@ -3552,3 +3552,34 @@ class TestChannelCursorPersistence:
         saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
         assert saved["channels"][CHANNEL]["last_ts"] == 200
         assert saved["channels"][CHANNEL]["seen"] == ["e1", "e2"]
+
+
+class TestCliPathResolution:
+    """Buzz Desktop's GUI executable must never be mistaken for the CLI."""
+
+    def _bundle(self, tmp_path, with_cli=True):
+        contents = tmp_path / "Buzz.app" / "Contents"
+        (contents / "MacOS").mkdir(parents=True)
+        gui = contents / "MacOS" / "Buzz"
+        gui.write_text("", encoding="utf-8")
+        bundled = contents / "Resources" / "bin" / "buzz"
+        if with_cli:
+            bundled.parent.mkdir(parents=True)
+            bundled.write_text("#!/bin/sh\n", encoding="utf-8")
+        return contents, gui, bundled
+
+    def test_app_executable_redirects_to_bundled_cli(self, tmp_path):
+        """cli_path inside Contents/MacOS is the app; use Resources/bin/buzz instead."""
+        _contents, gui, bundled = self._bundle(tmp_path)
+        assert _buzz_mod._resolve_cli_path(str(gui)) == str(bundled)
+
+    def test_app_executable_without_bundled_cli_is_refused(self, tmp_path):
+        """Never launch the GUI as a CLI, even if there is nothing to fall back to."""
+        _contents, gui, _bundled = self._bundle(tmp_path, with_cli=False)
+        assert _buzz_mod._resolve_cli_path(str(gui)) == ""
+
+    def test_ordinary_path_is_returned_unchanged(self, tmp_path):
+        cli = tmp_path / "bin" / "buzz"
+        cli.parent.mkdir()
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        assert _buzz_mod._resolve_cli_path(str(cli)) == str(cli)

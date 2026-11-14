@@ -336,7 +336,22 @@ def _resolve_cli_path(configured: str = "") -> str:
     """Resolve the buzz binary: explicit config → ``buzz`` on PATH → ``~/bin/buzz``; "" if none."""
     if configured:
         p = Path(configured).expanduser()
-        return str(p) if p.is_file() else ""
+        if not p.is_file():
+            return ""
+        # Buzz Desktop puts the GUI executable at Contents/MacOS/Buzz and the CLI at
+        # Contents/Resources/bin/buzz. APFS is case-insensitive, so a configured
+        # ".../Contents/MacOS/buzz" passes is_file() and matches the GUI app: spawning it
+        # opens a second app instance that exits immediately, hands focus to the running
+        # one, and returns no CLI output. Prefer the CLI that ships beside it.
+        if p.parent.name == "MacOS" and p.parent.parent.name == "Contents":
+            bundled = p.parent.parent / "Resources" / "bin" / "buzz"
+            if bundled.is_file():
+                logger.warning(
+                    "Buzz: cli_path %s is the app executable, not the CLI; using %s", p, bundled
+                )
+                return str(bundled)
+            return ""
+        return str(p)
     if found := shutil.which("buzz"):
         return found
     fallback = Path.home() / "bin" / "buzz"
